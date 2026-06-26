@@ -1,0 +1,35 @@
+name: ProChain Daily Report
+
+on:
+  schedule:
+    # 09:00 เวลาไทย (UTC+7) = 02:00 UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch:  # รันมือได้จาก GitHub Actions tab
+
+jobs:
+  run-report:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run ProChain Report Script
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_USER_EMAIL: ${{ secrets.AZURE_USER_EMAIL }}
+          AZURE_USER_PASSWORD: ${{ secrets.AZURE_USER_PASSWORD }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          SYSTEM_ACTIVE: ${{ secrets.SYSTEM_ACTIVE }}
+        run: python main.py
