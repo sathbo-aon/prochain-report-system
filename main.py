@@ -1,17 +1,16 @@
 """
-ProChain Daily Report System
-=============================
-อ่านอีเมล Outlook → ดาวน์โหลด Excel → บันทึก OneDrive → เขียน Google Sheet
+ProChain Daily Report System (Gmail Edition)
+==============================================
+อ่านอีเมล Gmail → ดาวน์โหลด Excel → บันทึก Google Drive → เขียน Google Sheet
 
 Environment variables ที่ต้องตั้งใน GitHub Secrets:
-  AZURE_CLIENT_ID       — Application (client) ID
-  AZURE_CLIENT_SECRET   — Client Secret Value
-  AZURE_TENANT_ID       — Directory (tenant) ID
-  AZURE_USER_EMAIL      — อีเมลที่ใช้รับ daily report
-  AZURE_USER_PASSWORD   — password ของอีเมลนั้น
-  GOOGLE_SERVICE_ACCOUNT_JSON — JSON ทั้งก้อนของ service account
-  SPREADSHEET_ID        — Google Sheet ID
-  SYSTEM_ACTIVE         — TRUE หรือ FALSE (dead key)
+  GMAIL_CLIENT_ID
+  GMAIL_CLIENT_SECRET
+  GMAIL_REFRESH_TOKEN
+  GOOGLE_SERVICE_ACCOUNT_JSON   — สำหรับ Sheets + Drive (service account เดิม)
+  SPREADSHEET_ID
+  DRIVE_FOLDER_ID                — โฟลเดอร์หลักใน Google Drive สำหรับเก็บไฟล์ต้นฉบับ
+  SYSTEM_ACTIVE                  — TRUE หรือ FALSE (dead key)
 """
 
 import os
@@ -21,34 +20,31 @@ import base64
 import logging
 from datetime import datetime, timezone, timedelta
 
-import msal
-import requests
+from google.oauth2.credentials import Credentials as UserCredentials
+from google.oauth2.service_account import Credentials as ServiceCredentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload
 from openpyxl import load_workbook
 import gspread
-from google.oauth2.service_account import Credentials
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
 # ─── Config ────────────────────────────────────────────────────────
-CLIENT_ID     = os.environ["AZURE_CLIENT_ID"]
-CLIENT_SECRET = os.environ["AZURE_CLIENT_SECRET"]
-TENANT_ID     = os.environ["AZURE_TENANT_ID"]
-USER_EMAIL    = os.environ["AZURE_USER_EMAIL"]
-USER_PASSWORD = os.environ["AZURE_USER_PASSWORD"]
-SPREADSHEET_ID = os.environ["SPREADSHEET_ID"]
-SYSTEM_ACTIVE  = os.environ.get("SYSTEM_ACTIVE", "TRUE").upper()
+GMAIL_CLIENT_ID     = os.environ["GMAIL_CLIENT_ID"]
+GMAIL_CLIENT_SECRET = os.environ["GMAIL_CLIENT_SECRET"]
+GMAIL_REFRESH_TOKEN = os.environ["GMAIL_REFRESH_TOKEN"]
+SPREADSHEET_ID       = os.environ["SPREADSHEET_ID"]
+DRIVE_FOLDER_ID      = os.environ["DRIVE_FOLDER_ID"]
+SYSTEM_ACTIVE        = os.environ.get("SYSTEM_ACTIVE", "TRUE").upper()
 
-ONEDRIVE_FOLDER = "/ProChain Reports"
 SUBJECT_KEYWORD = "daily report"
 
-SCOPES = [
-    "https://graph.microsoft.com/Mail.Read",
-    "https://graph.microsoft.com/Files.ReadWrite",
-    "https://graph.microsoft.com/User.Read",
+GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
+DRIVE_SHEETS_SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
 ]
-
-GRAPH = "https://graph.microsoft.com/v1.0"
 
 # ─── Dead Key ──────────────────────────────────────────────────────
 def check_dead_key():
@@ -57,71 +53,111 @@ def check_dead_key():
         return False
     return True
 
-# ─── Microsoft Graph Auth (Delegated) ──────────────────────────────
-def get_access_token() -> str:
-    app = msal.PublicClientApplication(
-        CLIENT_ID,
-        authority=f"https://login.microsoftonline.com/{TENANT_ID}",
+# ─── Gmail Auth ────────────────────────────────────────────────────
+def get_gmail_service():
+    creds = UserCredentials(
+        token=None,
+        refresh_token=GMAIL_REFRESH_TOKEN,
+        client_id=GMAIL_CLIENT_ID,
+        client_secret=GMAIL_CLIENT_SECRET,
+        token_uri="https://oauth2.googleapis.com/token",
+        scopes=GMAIL_SCOPES,
     )
-    result = app.acquire_token_by_username_password(
-        username=USER_EMAIL,
-        password=USER_PASSWORD,
-        scopes=SCOPES,
-    )
-    if "access_token" not in result:
-        raise RuntimeError(f"Auth failed: {result.get('error_description')}")
-    log.info("✅ ได้ access token แล้ว")
-    return result["access_token"]
+    return build("gmail", "v1", credentials=creds)
 
-# ─── Outlook: ดึงอีเมลวันนี้ ──────────────────────────────────────
-def fetch_today_emails(token: str) -> list[dict]:
-    headers = {"Authorization": f"Bearer {token}"}
+# ─── Google Sheets / Drive Auth (Service Account) ─────────────────
+def get_service_account_creds():
+    sa_json = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
+    creds_dict = json.loads(sa_json)
+    return ServiceCredentials.from_service_account_info(
+        creds_dict, scopes=DRIVE_SHEETS_SCOPES
+    )
+
+def get_drive_service():
+    creds = get_service_account_creds()
+    return build("drive", "v3", credentials=creds)
+
+def get_gsheet_client():
+    creds = get_service_account_creds()
+    return gspread.authorize(creds)
+
+# ─── Gmail: ดึงอีเมลวันนี้ ─────────────────────────────────────────
+def fetch_today_emails(service) -> list[dict]:
     tz_thai = timezone(timedelta(hours=7))
-    today = datetime.now(tz_thai).strftime("%Y-%m-%dT00:00:00Z")
+    today_str = datetime.now(tz_thai).strftime("%Y/%m/%d")
 
-    filter_q = (
-        f"receivedDateTime ge {today}"
-        f" and contains(subject, '{SUBJECT_KEYWORD}')"
-        f" and hasAttachments eq true"
-    )
-    url = f"{GRAPH}/me/messages?$filter={filter_q}&$select=id,subject,receivedDateTime"
-    resp = requests.get(url, headers=headers)
-    resp.raise_for_status()
-    messages = resp.json().get("value", [])
+    query = f'subject:"{SUBJECT_KEYWORD}" has:attachment after:{today_str}'
+    results = service.users().messages().list(userId="me", q=query).execute()
+    messages = results.get("messages", [])
     log.info(f"📬 พบ {len(messages)} อีเมลวันนี้")
     return messages
 
-# ─── Outlook: ดึง attachments ─────────────────────────────────────
-def fetch_attachments(token: str, message_id: str) -> list[dict]:
-    headers = {"Authorization": f"Bearer {token}"}
-    url = f"{GRAPH}/me/messages/{message_id}/attachments"
-    resp = requests.get(url, headers=headers)
-    resp.raise_for_status()
-    return resp.json().get("value", [])
+# ─── Gmail: ดึง attachments ────────────────────────────────────────
+def fetch_attachments(service, message_id: str) -> list[dict]:
+    msg = service.users().messages().get(userId="me", id=message_id).execute()
+    subject = ""
+    for header in msg["payload"].get("headers", []):
+        if header["name"].lower() == "subject":
+            subject = header["value"]
 
-# ─── OneDrive: บันทึกไฟล์ ─────────────────────────────────────────
-def save_to_onedrive(token: str, filename: str, content_b64: str, project_name: str, report_date: str) -> str:
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/octet-stream",
+    attachments = []
+    parts = msg["payload"].get("parts", [])
+    for part in parts:
+        filename = part.get("filename", "")
+        if filename.lower().endswith((".xlsx", ".xls")):
+            att_id = part["body"].get("attachmentId")
+            if att_id:
+                att = service.users().messages().attachments().get(
+                    userId="me", messageId=message_id, id=att_id
+                ).execute()
+                content_b64 = att["data"]
+                # Gmail ใช้ URL-safe base64 ต้องแปลงก่อนใช้
+                content_bytes = base64.urlsafe_b64decode(content_b64)
+                content_std_b64 = base64.b64encode(content_bytes).decode()
+                attachments.append({
+                    "name": filename,
+                    "content_b64": content_std_b64,
+                })
+    return attachments, subject
+
+# ─── Google Drive: บันทึกไฟล์ ──────────────────────────────────────
+def get_or_create_folder(drive_service, name: str, parent_id: str) -> str:
+    query = (
+        f"name='{name}' and '{parent_id}' in parents "
+        f"and mimeType='application/vnd.google-apps.folder' and trashed=false"
+    )
+    results = drive_service.files().list(q=query, fields="files(id, name)").execute()
+    files = results.get("files", [])
+    if files:
+        return files[0]["id"]
+
+    metadata = {
+        "name": name,
+        "mimeType": "application/vnd.google-apps.folder",
+        "parents": [parent_id],
     }
+    folder = drive_service.files().create(body=metadata, fields="id").execute()
+    return folder["id"]
+
+def save_to_drive(drive_service, filename: str, content_b64: str, project_name: str, report_date: str):
     content = base64.b64decode(content_b64)
 
-    # จัดโฟลเดอร์ตาม Site และเดือน
     try:
         date_obj = datetime.strptime(report_date.strip(), "%d/%m/%Y")
-        month_folder = date_obj.strftime("%Y-%m")
+        month_folder_name = date_obj.strftime("%Y-%m")
     except Exception:
-        month_folder = datetime.now().strftime("%Y-%m")
+        month_folder_name = datetime.now().strftime("%Y-%m")
 
-    folder_path = f"{ONEDRIVE_FOLDER}/{project_name}/{month_folder}"
-    safe_filename = filename.replace("'", "")
-    upload_url = f"{GRAPH}/me/drive/root:{folder_path}/{safe_filename}:/content"
+    project_folder_id = get_or_create_folder(drive_service, project_name or "Unknown Project", DRIVE_FOLDER_ID)
+    month_folder_id = get_or_create_folder(drive_service, month_folder_name, project_folder_id)
 
-    resp = requests.put(upload_url, headers=headers, data=content)
-    resp.raise_for_status()
-    log.info(f"💾 บันทึกไฟล์ OneDrive: {folder_path}/{safe_filename}")
-    return safe_filename
+    media = MediaIoBaseUpload(
+        io.BytesIO(content),
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+    metadata = {"name": filename, "parents": [month_folder_id]}
+    drive_service.files().create(body=metadata, media_body=media, fields="id").execute()
+    log.info(f"💾 บันทึกไฟล์ Drive: {project_name}/{month_folder_name}/{filename}")
 
 # ─── Excel: อ่านข้อมูล ────────────────────────────────────────────
 def parse_excel(content_b64: str, filename: str) -> dict:
@@ -137,7 +173,6 @@ def parse_excel(content_b64: str, filename: str) -> dict:
             return v.strftime("%d/%m/%Y")
         return str(v).strip()
 
-    # ─── Header fields ──────────────────────────────────────────
     project_name = cell(7, 3)
     report_date  = cell(8, 3)
     week_no      = cell(8, 6)
@@ -154,9 +189,8 @@ def parse_excel(content_b64: str, filename: str) -> dict:
     remarks      = cell(44, 1)
     imported_at  = datetime.now().strftime("%d/%m/%Y %H:%M")
 
-    # ─── Activity rows (dynamic) ────────────────────────────────
     activities = []
-    r = 16  # เริ่มจาก row แรกของข้อมูล (ต่อจาก header row 15)
+    r = 16
     while True:
         act_code = cell(r, 1)
         act_desc = cell(r, 3)
@@ -164,37 +198,26 @@ def parse_excel(content_b64: str, filename: str) -> dict:
         actual_pct = cell(r, 7)
         remark   = cell(r, 8)
 
-        # หยุดเมื่อไม่มีข้อมูลทั้ง ActivityCode และ Description
         if not act_code and not act_desc:
-            if r > 19:  # อ่านอย่างน้อย 4 แถว
+            if r > 19:
                 break
             r += 1
             continue
 
         activities.append({
-            "วันที่": report_date,
-            "ชื่อโครงการ": project_name,
-            "Report No.": report_no,
-            "ActivityCode": act_code,
-            "Description": act_desc,
-            "PlanPct": plan_pct,
-            "ActualPct": actual_pct,
-            "Variance": str(
-                round(float(actual_pct) - float(plan_pct), 2)
-            ) if plan_pct and actual_pct else "",
-            "Status": "Delayed" if plan_pct and actual_pct and
-                      float(actual_pct) < float(plan_pct) else "On Track",
-            "Remark": remark,
-            "ไฟล์ต้นฉบับ": filename,
-            "นำเข้าเมื่อ": imported_at,
+            "วันที่": report_date, "ชื่อโครงการ": project_name, "Report No.": report_no,
+            "ActivityCode": act_code, "Description": act_desc,
+            "PlanPct": plan_pct, "ActualPct": actual_pct,
+            "Variance": str(round(float(actual_pct) - float(plan_pct), 2)) if plan_pct and actual_pct else "",
+            "Status": "Delayed" if plan_pct and actual_pct and float(actual_pct) < float(plan_pct) else "On Track",
+            "Remark": remark, "ไฟล์ต้นฉบับ": filename, "นำเข้าเมื่อ": imported_at,
         })
         r += 1
-        if r > 100:  # safety limit
+        if r > 100:
             break
 
-    # ─── Material rows (dynamic) ────────────────────────────────
     materials = []
-    r = 22  # เริ่มจาก row แรกของข้อมูล (ต่อจาก header row 21)
+    r = 22
     while True:
         mat_code = cell(r, 2)
         mat_desc = cell(r, 3)
@@ -210,64 +233,32 @@ def parse_excel(content_b64: str, filename: str) -> dict:
             continue
 
         materials.append({
-            "วันที่": report_date,
-            "ชื่อโครงการ": project_name,
-            "Report No.": report_no,
-            "MatCode": mat_code,
-            "Description": mat_desc,
-            "Unit": mat_unit,
-            "Qty": mat_qty,
-            "InOut": mat_inout,
-            "Supplier": mat_supplier,
-            "ไฟล์ต้นฉบับ": filename,
-            "นำเข้าเมื่อ": imported_at,
+            "วันที่": report_date, "ชื่อโครงการ": project_name, "Report No.": report_no,
+            "MatCode": mat_code, "Description": mat_desc, "Unit": mat_unit,
+            "Qty": mat_qty, "InOut": mat_inout, "Supplier": mat_supplier,
+            "ไฟล์ต้นฉบับ": filename, "นำเข้าเมื่อ": imported_at,
         })
         r += 1
         if r > 200:
             break
 
-    # ─── Daily Log ──────────────────────────────────────────────
     daily_log = {
-        "วันที่": report_date,
-        "ชื่อโครงการ": project_name,
-        "Report No.": report_no,
-        "สัปดาห์ที่": week_no,
-        "Site Manager": site_manager,
-        "เลขที่สัญญา": contract_no,
-        "ชั่วโมงทำงาน": work_hours,
-        "อากาศเช้า": weather_am,
-        "อากาศบ่าย": weather_pm,
-        "คนงานรวม": workforce,
-        "อุบัติเหตุ": accident,
-        "Near Miss": near_miss,
-        "First Aid": first_aid,
-        "หมายเหตุ": remarks,
-        "ไฟล์ต้นฉบับ": filename,
-        "นำเข้าเมื่อ": imported_at,
+        "วันที่": report_date, "ชื่อโครงการ": project_name, "Report No.": report_no,
+        "สัปดาห์ที่": week_no, "Site Manager": site_manager, "เลขที่สัญญา": contract_no,
+        "ชั่วโมงทำงาน": work_hours, "อากาศเช้า": weather_am, "อากาศบ่าย": weather_pm,
+        "คนงานรวม": workforce, "อุบัติเหตุ": accident, "Near Miss": near_miss,
+        "First Aid": first_aid, "หมายเหตุ": remarks,
+        "ไฟล์ต้นฉบับ": filename, "นำเข้าเมื่อ": imported_at,
     }
 
     log.info(f"📊 อ่านข้อมูล: {len(activities)} กิจกรรม, {len(materials)} รายการวัสดุ")
     return {
-        "project_name": project_name,
-        "report_date": report_date,
-        "daily_log": daily_log,
-        "activities": activities,
-        "materials": materials,
+        "project_name": project_name, "report_date": report_date,
+        "daily_log": daily_log, "activities": activities, "materials": materials,
     }
 
 # ─── Google Sheets ────────────────────────────────────────────────
-def get_gsheet_client():
-    sa_json = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
-    creds_dict = json.loads(sa_json)
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
-    creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-    return gspread.authorize(creds)
-
 def check_system_active_in_sheet(ss) -> bool:
-    """เช็ค dead key จาก Config sheet"""
     try:
         config = ss.worksheet("Config")
         val = config.acell("B1").value
@@ -285,15 +276,42 @@ def append_to_sheet(ss, sheet_name: str, rows: list[list]):
         ws.append_rows(rows, value_input_option="USER_ENTERED")
         log.info(f"✅ บันทึก {len(rows)} แถวลง '{sheet_name}'")
 
-def write_to_gsheet(data: dict):
-    client = get_gsheet_client()
-    ss = client.open_by_key(SPREADSHEET_ID)
+def update_stock_summary(ss, materials: list[dict]):
+    if not materials:
+        return
+    ws = ss.worksheet("Stock Summary")
+    existing = ws.get_all_values()
+    existing_keys = set()
+    for row in existing[1:]:
+        if len(row) >= 2:
+            existing_keys.add((row[0], row[1]))
+
+    new_rows = []
+    for m in materials:
+        key = (m["ชื่อโครงการ"], m["MatCode"])
+        if key not in existing_keys:
+            row_num = len(existing) + len(new_rows) + 1
+            new_rows.append([
+                m["ชื่อโครงการ"], m["MatCode"], m["Description"], m["Unit"],
+                f'=SUMIFS(\'Material Ledger\'!G:G,\'Material Ledger\'!B:B,A{row_num},\'Material Ledger\'!D:D,B{row_num},\'Material Ledger\'!H:H,"IN")',
+                f'=SUMIFS(\'Material Ledger\'!G:G,\'Material Ledger\'!B:B,A{row_num},\'Material Ledger\'!D:D,B{row_num},\'Material Ledger\'!H:H,"OUT")',
+                f'=E{row_num}-F{row_num}',
+                "",
+                f'=MAXIFS(\'Material Ledger\'!A:A,\'Material Ledger\'!B:B,A{row_num},\'Material Ledger\'!D:D,B{row_num})',
+            ])
+            existing_keys.add(key)
+
+    if new_rows:
+        ws.append_rows(new_rows, value_input_option="USER_ENTERED")
+        log.info(f"✅ เพิ่ม {len(new_rows)} รายการใหม่ใน Stock Summary")
+
+def write_to_gsheet(gc, data: dict):
+    ss = gc.open_by_key(SPREADSHEET_ID)
 
     if not check_system_active_in_sheet(ss):
         return
 
     dl = data["daily_log"]
-    # Daily Log
     daily_row = [[
         dl["วันที่"], dl["ชื่อโครงการ"], dl["Report No."], dl["สัปดาห์ที่"],
         dl["Site Manager"], dl["เลขที่สัญญา"], dl["ชั่วโมงทำงาน"],
@@ -303,103 +321,53 @@ def write_to_gsheet(data: dict):
     ]]
     append_to_sheet(ss, "Daily Log", daily_row)
 
-    # Work Progress
     act_rows = [[
-        a["วันที่"], a["ชื่อโครงการ"], a["Report No."],
-        a["ActivityCode"], a["Description"],
-        a["PlanPct"], a["ActualPct"], a["Variance"],
-        a["Status"], a["Remark"],
+        a["วันที่"], a["ชื่อโครงการ"], a["Report No."], a["ActivityCode"], a["Description"],
+        a["PlanPct"], a["ActualPct"], a["Variance"], a["Status"], a["Remark"],
         a["ไฟล์ต้นฉบับ"], a["นำเข้าเมื่อ"],
     ] for a in data["activities"]]
     append_to_sheet(ss, "Work Progress", act_rows)
 
-    # Material Ledger
     mat_rows = [[
-        m["วันที่"], m["ชื่อโครงการ"], m["Report No."],
-        m["MatCode"], m["Description"], m["Unit"],
-        m["Qty"], m["InOut"], m["Supplier"],
+        m["วันที่"], m["ชื่อโครงการ"], m["Report No."], m["MatCode"], m["Description"],
+        m["Unit"], m["Qty"], m["InOut"], m["Supplier"],
         m["ไฟล์ต้นฉบับ"], m["นำเข้าเมื่อ"],
     ] for m in data["materials"]]
     append_to_sheet(ss, "Material Ledger", mat_rows)
 
-    # Stock Summary — เพิ่ม/อัปเดตรายการ
     update_stock_summary(ss, data["materials"])
-
-def update_stock_summary(ss, materials: list[dict]):
-    """อัปเดต Stock Summary โดยหา row ที่ตรงกับ ชื่อโครงการ + MatCode แล้ว recalculate"""
-    if not materials:
-        return
-    ws = ss.worksheet("Stock Summary")
-    existing = ws.get_all_values()
-    # header = existing[0] ถ้ามี
-
-    # หา pairs ที่ยังไม่มีใน summary แล้วเพิ่มแถวใหม่
-    existing_keys = set()
-    for row in existing[1:]:  # skip header
-        if len(row) >= 2:
-            existing_keys.add((row[0], row[1]))  # ชื่อโครงการ, MatCode
-
-    new_rows = []
-    for m in materials:
-        key = (m["ชื่อโครงการ"], m["MatCode"])
-        if key not in existing_keys:
-            # เพิ่มแถวใหม่ สูตร SUMIF จะคำนวณเองใน Sheet
-            project = m["ชื่อโครงการ"]
-            mat_code = m["MatCode"]
-            desc = m["Description"]
-            unit = m["Unit"]
-            new_rows.append([
-                project, mat_code, desc, unit,
-                f'=SUMIFS(\'Material Ledger\'!G:G,\'Material Ledger\'!B:B,A{len(existing)+len(new_rows)+1},\'Material Ledger\'!D:D,B{len(existing)+len(new_rows)+1},\'Material Ledger\'!H:H,"IN")',
-                f'=SUMIFS(\'Material Ledger\'!G:G,\'Material Ledger\'!B:B,A{len(existing)+len(new_rows)+1},\'Material Ledger\'!D:D,B{len(existing)+len(new_rows)+1},\'Material Ledger\'!H:H,"OUT")',
-                f'=E{len(existing)+len(new_rows)+1}-F{len(existing)+len(new_rows)+1}',
-                "",  # Threshold (กรอกเองใน Sheet)
-                f'=MAXIFS(\'Material Ledger\'!A:A,\'Material Ledger\'!B:B,A{len(existing)+len(new_rows)+1},\'Material Ledger\'!D:D,B{len(existing)+len(new_rows)+1})',
-            ])
-            existing_keys.add(key)
-
-    if new_rows:
-        ws.append_rows(new_rows, value_input_option="USER_ENTERED")
-        log.info(f"✅ เพิ่ม {len(new_rows)} รายการใหม่ใน Stock Summary")
 
 # ─── Main ─────────────────────────────────────────────────────────
 def main():
-    log.info("🚀 เริ่มระบบ ProChain Daily Report")
+    log.info("🚀 เริ่มระบบ ProChain Daily Report (Gmail Edition)")
 
-    # เช็ค dead key จาก env variable ก่อน
     if not check_dead_key():
         return
 
-    token = get_access_token()
-    messages = fetch_today_emails(token)
+    gmail = get_gmail_service()
+    drive = get_drive_service()
+    gc = get_gsheet_client()
 
+    messages = fetch_today_emails(gmail)
     if not messages:
         log.info("📭 ไม่มีอีเมลใหม่วันนี้")
         return
 
-    for msg in messages:
-        subject = msg.get("subject", "")
+    for msg_ref in messages:
+        attachments, subject = fetch_attachments(gmail, msg_ref["id"])
         log.info(f"📧 ประมวลผล: {subject}")
 
-        # แยก project name และ date จาก subject
-        # format: "daily report-ชื่อโครงการ-วันที่"
         parts = subject.split("-")
         project_from_subject = parts[1].strip() if len(parts) > 1 else ""
         date_from_subject    = parts[2].strip() if len(parts) > 2 else ""
 
-        attachments = fetch_attachments(token, msg["id"])
         for att in attachments:
-            name = att.get("name", "")
-            if not name.lower().endswith((".xlsx", ".xls")):
-                continue
-
+            name = att["name"]
+            content_b64 = att["content_b64"]
             log.info(f"📎 ประมวลผลไฟล์: {name}")
-            content_b64 = att.get("contentBytes", "")
 
-            # อ่าน Excel
             data = parse_excel(content_b64, name)
 
-            # ใช้ข้อมูลจาก Excel ถ้า parse ได้ ไม่งั้นใช้จาก subject
             if not data["project_name"]:
                 data["daily_log"]["ชื่อโครงการ"] = project_from_subject
                 data["project_name"] = project_from_subject
@@ -407,17 +375,12 @@ def main():
                 data["daily_log"]["วันที่"] = date_from_subject
                 data["report_date"] = date_from_subject
 
-            # บันทึกลง OneDrive
             try:
-                save_to_onedrive(
-                    token, name, content_b64,
-                    data["project_name"], data["report_date"]
-                )
+                save_to_drive(drive, name, content_b64, data["project_name"], data["report_date"])
             except Exception as e:
-                log.warning(f"⚠️ บันทึก OneDrive ไม่ได้: {e} — ดำเนินการต่อ")
+                log.warning(f"⚠️ บันทึก Drive ไม่ได้: {e} — ดำเนินการต่อ")
 
-            # บันทึกลง Google Sheet
-            write_to_gsheet(data)
+            write_to_gsheet(gc, data)
 
     log.info("✅ เสร็จสิ้น")
 
