@@ -4,7 +4,7 @@ on:
   schedule:
     # 09:00 เวลาไทย (UTC+7) = 02:00 UTC
     - cron: '0 2 * * *'
-  workflow_dispatch:  # รันมือได้จาก GitHub Actions tab
+  workflow_dispatch:
 
 jobs:
   run-report:
@@ -24,12 +24,11 @@ jobs:
 
       - name: Run ProChain Report Script
         env:
-          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
-          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
-          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-          AZURE_USER_EMAIL: ${{ secrets.AZURE_USER_EMAIL }}
-          AZURE_USER_PASSWORD: ${{ secrets.AZURE_USER_PASSWORD }}
+          GMAIL_CLIENT_ID: ${{ secrets.GMAIL_CLIENT_ID }}
+          GMAIL_CLIENT_SECRET: ${{ secrets.GMAIL_CLIENT_SECRET }}
+          GMAIL_REFRESH_TOKEN: ${{ secrets.GMAIL_REFRESH_TOKEN }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
           SYSTEM_ACTIVE: ${{ secrets.SYSTEM_ACTIVE }}
         run: python main.py
