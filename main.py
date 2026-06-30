@@ -191,7 +191,8 @@ def parse_excel(content_b64: str, filename: str) -> dict:
 
     activities = []
     r = 16
-    while True:
+    ACTIVITY_TABLE_END = 19  # tbl_Activity สิ้นสุดที่ row 19 (header row 15 + 4 data rows)
+    while r <= ACTIVITY_TABLE_END:
         act_code = cell(r, 1)
         act_desc = cell(r, 3)
         plan_pct = cell(r, 6)
@@ -199,8 +200,6 @@ def parse_excel(content_b64: str, filename: str) -> dict:
         remark   = cell(r, 8)
 
         if not act_code and not act_desc:
-            if r > 19:
-                break
             r += 1
             continue
 
@@ -213,12 +212,11 @@ def parse_excel(content_b64: str, filename: str) -> dict:
             "Remark": remark, "ไฟล์ต้นฉบับ": filename, "นำเข้าเมื่อ": imported_at,
         })
         r += 1
-        if r > 100:
-            break
 
     materials = []
     r = 22
-    while True:
+    MATERIAL_TABLE_END = 29  # tbl_Material สิ้นสุดที่ row 29 (header row 21 + 8 data rows)
+    while r <= MATERIAL_TABLE_END:
         mat_code = cell(r, 2)
         mat_desc = cell(r, 3)
         mat_unit = cell(r, 5)
@@ -227,8 +225,6 @@ def parse_excel(content_b64: str, filename: str) -> dict:
         mat_supplier = cell(r, 8)
 
         if not mat_desc and not mat_qty:
-            if r > 29:
-                break
             r += 1
             continue
 
@@ -239,8 +235,6 @@ def parse_excel(content_b64: str, filename: str) -> dict:
             "ไฟล์ต้นฉบับ": filename, "นำเข้าเมื่อ": imported_at,
         })
         r += 1
-        if r > 200:
-            break
 
     daily_log = {
         "วันที่": report_date, "ชื่อโครงการ": project_name, "Report No.": report_no,
