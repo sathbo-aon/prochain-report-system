@@ -179,21 +179,23 @@ def parse_excel(content_b64: str, filename: str) -> dict:
             return v.strftime("%d/%m/%Y")
         return str(v).strip()
 
-    project_name = cell(7, 3)
-    report_date  = cell(8, 3)
-    week_no      = cell(8, 6)
-    report_no    = cell(8, 9)
-    site_manager = cell(9, 3)
-    contract_no  = cell(9, 6)
-    work_hours   = cell(10, 3)
-    weather_am   = cell(10, 7)
-    weather_pm   = cell(10, 9)
-    workforce    = cell(13, 8)
-    accident     = cell(39, 2)
-    near_miss    = cell(39, 3)
-    first_aid    = cell(39, 4)
-    remarks      = cell(44, 1)
-    imported_at  = datetime.now().strftime("%d/%m/%Y %H:%M")
+    project_name     = cell(7, 3)
+    report_date      = cell(8, 3)
+    week_no          = cell(8, 6)
+    report_no        = cell(8, 8)   # H8
+    site_manager     = cell(9, 3)
+    contract_no      = cell(9, 6)
+    work_hours       = cell(10, 3)
+    weather_am       = cell(10, 7)
+    weather_pm       = cell(10, 9)
+    workforce        = cell(13, 8)
+    accident         = cell(39, 2)
+    near_miss        = cell(39, 3)
+    first_aid        = cell(39, 4)
+    safety_talk      = cell(39, 5)  # E39
+    safety_status    = cell(39, 8)  # H39
+    incident_desc    = cell(44, 1)  # A44
+    imported_at      = datetime.now().strftime("%d/%m/%Y %H:%M")
 
     activities = []
     r = 16
@@ -247,8 +249,9 @@ def parse_excel(content_b64: str, filename: str) -> dict:
         "สัปดาห์ที่": week_no, "Site Manager": site_manager, "เลขที่สัญญา": contract_no,
         "ชั่วโมงทำงาน": work_hours, "อากาศเช้า": weather_am, "อากาศบ่าย": weather_pm,
         "คนงานรวม": workforce, "อุบัติเหตุ": accident, "Near Miss": near_miss,
-        "First Aid": first_aid, "หมายเหตุ": remarks,
-        "ไฟล์ต้นฉบับ": filename, "นำเข้าเมื่อ": imported_at,
+        "First Aid": first_aid, "Safety Talk": safety_talk, "Safety Status": safety_status,
+        "Incident Description": incident_desc,
+        "นำเข้าเมื่อ": imported_at, "ไฟล์ต้นฉบับ": filename,
     }
 
     log.info(f"📊 อ่านข้อมูล: {len(activities)} กิจกรรม, {len(materials)} รายการวัสดุ")
@@ -305,6 +308,19 @@ def update_stock_summary(ss, materials: list[dict]):
         ws.append_rows(new_rows, value_input_option="USER_ENTERED")
         log.info(f"✅ เพิ่ม {len(new_rows)} รายการใหม่ใน Stock Summary")
 
+def is_duplicate(ss, report_no: str, project_name: str) -> bool:
+    """เช็คว่า Report No. + ชื่อโครงการ นี้มีใน Daily Log แล้วหรือยัง"""
+    try:
+        ws = ss.worksheet("Daily Log")
+        values = ws.get_all_values()
+        for row in values[1:]:  # skip header
+            if len(row) >= 3 and row[2] == report_no and row[1] == project_name:
+                log.warning(f"⚠️ พบข้อมูลซ้ำ Report No.={report_no} โครงการ={project_name} — ข้ามการบันทึก")
+                return True
+        return False
+    except Exception:
+        return False
+
 def write_to_gsheet(gc, data: dict):
     ss = gc.open_by_key(SPREADSHEET_ID)
 
@@ -312,12 +328,17 @@ def write_to_gsheet(gc, data: dict):
         return
 
     dl = data["daily_log"]
+
+    # เช็คซ้ำก่อนบันทึก
+    if is_duplicate(ss, dl["Report No."], dl["ชื่อโครงการ"]):
+        return
     daily_row = [[
         dl["วันที่"], dl["ชื่อโครงการ"], dl["Report No."], dl["สัปดาห์ที่"],
         dl["Site Manager"], dl["เลขที่สัญญา"], dl["ชั่วโมงทำงาน"],
         dl["อากาศเช้า"], dl["อากาศบ่าย"], dl["คนงานรวม"],
         dl["อุบัติเหตุ"], dl["Near Miss"], dl["First Aid"],
-        dl["หมายเหตุ"], dl["ไฟล์ต้นฉบับ"], dl["นำเข้าเมื่อ"],
+        dl["Safety Talk"], dl["Safety Status"], dl["Incident Description"],
+        dl["นำเข้าเมื่อ"], dl["ไฟล์ต้นฉบับ"],
     ]]
     append_to_sheet(ss, "Daily Log", daily_row)
 
