@@ -40,8 +40,11 @@ SYSTEM_ACTIVE        = os.environ.get("SYSTEM_ACTIVE", "TRUE").upper()
 
 SUBJECT_KEYWORD = "daily report"
 
-GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
-DRIVE_SHEETS_SCOPES = [
+GMAIL_SCOPES = [
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/drive",
+]
+SHEETS_SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
@@ -53,9 +56,10 @@ def check_dead_key():
         return False
     return True
 
-# ─── Gmail Auth ────────────────────────────────────────────────────
-def get_gmail_service():
-    creds = UserCredentials(
+# ─── Gmail + Drive Auth (OAuth User) ───────────────────────────────
+def get_user_creds():
+    """ใช้ OAuth token เดียวกันสำหรับทั้ง Gmail และ Drive"""
+    return UserCredentials(
         token=None,
         refresh_token=GMAIL_REFRESH_TOKEN,
         client_id=GMAIL_CLIENT_ID,
@@ -63,19 +67,21 @@ def get_gmail_service():
         token_uri="https://oauth2.googleapis.com/token",
         scopes=GMAIL_SCOPES,
     )
-    return build("gmail", "v1", credentials=creds)
 
-# ─── Google Sheets / Drive Auth (Service Account) ─────────────────
+def get_gmail_service():
+    return build("gmail", "v1", credentials=get_user_creds())
+
+def get_drive_service():
+    """ใช้ OAuth ของเจ้าของ Drive แทน Service Account เพื่อไม่ติด storage quota"""
+    return build("drive", "v3", credentials=get_user_creds())
+
+# ─── Google Sheets Auth (Service Account) ──────────────────────────
 def get_service_account_creds():
     sa_json = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
     creds_dict = json.loads(sa_json)
     return ServiceCredentials.from_service_account_info(
-        creds_dict, scopes=DRIVE_SHEETS_SCOPES
+        creds_dict, scopes=SHEETS_SCOPES
     )
-
-def get_drive_service():
-    creds = get_service_account_creds()
-    return build("drive", "v3", credentials=creds)
 
 def get_gsheet_client():
     creds = get_service_account_creds()
