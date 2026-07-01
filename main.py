@@ -162,8 +162,11 @@ def save_to_drive(drive_service, filename: str, content_b64: str, project_name: 
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
     metadata = {"name": filename, "parents": [month_folder_id]}
-    drive_service.files().create(body=metadata, media_body=media, fields="id").execute()
+    file = drive_service.files().create(body=metadata, media_body=media, fields="id").execute()
+    file_id = file.get("id", "")
+    drive_link = f"https://drive.google.com/file/d/{file_id}/view" if file_id else ""
     log.info(f"💾 บันทึกไฟล์ Drive: {project_name}/{month_folder_name}/{filename}")
+    return drive_link
 
 # ─── Excel: อ่านข้อมูล ────────────────────────────────────────────
 def parse_excel(content_b64: str, filename: str) -> dict:
@@ -251,7 +254,7 @@ def parse_excel(content_b64: str, filename: str) -> dict:
         "คนงานรวม": workforce, "อุบัติเหตุ": accident, "Near Miss": near_miss,
         "First Aid": first_aid, "Safety Talk": safety_talk, "Safety Status": safety_status,
         "Incident Description": incident_desc,
-        "นำเข้าเมื่อ": imported_at, "ไฟล์ต้นฉบับ": filename,
+        "นำเข้าเมื่อ": imported_at, "ไฟล์ต้นฉบับ": "",  # จะอัปเดตหลัง upload Drive
     }
 
     log.info(f"📊 อ่านข้อมูล: {len(activities)} กิจกรรม, {len(materials)} รายการวัสดุ")
@@ -332,13 +335,17 @@ def write_to_gsheet(gc, data: dict):
     # เช็คซ้ำก่อนบันทึก
     if is_duplicate(ss, dl["Report No."], dl["ชื่อโครงการ"]):
         return
+    # สร้าง HYPERLINK formula สำหรับ Google Sheet ถ้ามี link
+    file_link = dl["ไฟล์ต้นฉบับ"]
+    file_cell = f'=HYPERLINK("{file_link}","เปิดไฟล์")' if file_link else ""
+
     daily_row = [[
         dl["วันที่"], dl["ชื่อโครงการ"], dl["Report No."], dl["สัปดาห์ที่"],
         dl["Site Manager"], dl["เลขที่สัญญา"], dl["ชั่วโมงทำงาน"],
         dl["อากาศเช้า"], dl["อากาศบ่าย"], dl["คนงานรวม"],
         dl["อุบัติเหตุ"], dl["Near Miss"], dl["First Aid"],
         dl["Safety Talk"], dl["Safety Status"], dl["Incident Description"],
-        dl["นำเข้าเมื่อ"], dl["ไฟล์ต้นฉบับ"],
+        dl["นำเข้าเมื่อ"], file_cell,
     ]]
     append_to_sheet(ss, "Daily Log", daily_row)
 
@@ -397,7 +404,8 @@ def main():
                 data["report_date"] = date_from_subject
 
             try:
-                save_to_drive(drive, name, content_b64, data["project_name"], data["report_date"])
+                drive_link = save_to_drive(drive, name, content_b64, data["project_name"], data["report_date"])
+                data["daily_log"]["ไฟล์ต้นฉบับ"] = drive_link
             except Exception as e:
                 log.warning(f"⚠️ บันทึก Drive ไม่ได้: {e} — ดำเนินการต่อ")
 
