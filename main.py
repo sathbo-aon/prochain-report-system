@@ -220,7 +220,7 @@ def parse_excel(content_b64: str, filename: str) -> dict:
             "PlanPct": plan_pct, "ActualPct": actual_pct,
             "Variance": str(round(float(actual_pct) - float(plan_pct), 2)) if plan_pct and actual_pct else "",
             "Status": "Delayed" if plan_pct and actual_pct and float(actual_pct) < float(plan_pct) else "On Track",
-            "Remark": remark, "ไฟล์ต้นฉบับ": filename, "นำเข้าเมื่อ": imported_at,
+            "Remark": remark, "นำเข้าเมื่อ": imported_at,
         })
         r += 1
 
@@ -243,7 +243,7 @@ def parse_excel(content_b64: str, filename: str) -> dict:
             "วันที่": report_date, "ชื่อโครงการ": project_name, "Report No.": report_no,
             "MatCode": mat_code, "Description": mat_desc, "Unit": mat_unit,
             "Qty": mat_qty, "InOut": mat_inout, "Supplier": mat_supplier,
-            "ไฟล์ต้นฉบับ": filename, "นำเข้าเมื่อ": imported_at,
+            "นำเข้าเมื่อ": imported_at,
         })
         r += 1
 
@@ -352,14 +352,14 @@ def write_to_gsheet(gc, data: dict):
     act_rows = [[
         a["วันที่"], a["ชื่อโครงการ"], a["Report No."], a["ActivityCode"], a["Description"],
         a["PlanPct"], a["ActualPct"], a["Variance"], a["Status"], a["Remark"],
-        a["ไฟล์ต้นฉบับ"], a["นำเข้าเมื่อ"],
+        a["นำเข้าเมื่อ"],
     ] for a in data["activities"]]
     append_to_sheet(ss, "Work Progress", act_rows)
 
     mat_rows = [[
         m["วันที่"], m["ชื่อโครงการ"], m["Report No."], m["MatCode"], m["Description"],
         m["Unit"], m["Qty"], m["InOut"], m["Supplier"],
-        m["ไฟล์ต้นฉบับ"], m["นำเข้าเมื่อ"],
+        m["นำเข้าเมื่อ"],
     ] for m in data["materials"]]
     append_to_sheet(ss, "Material Ledger", mat_rows)
 
