@@ -169,6 +169,32 @@ def save_to_drive(drive_service, filename: str, content_b64: str, project_name: 
     return drive_link
 
 # ─── Excel: อ่านข้อมูล ────────────────────────────────────────────
+def find_table_row(ws, table_name: str):
+    """หา row เริ่มต้นและสิ้นสุดของ Table จริงๆ ใน Excel"""
+    for t in ws.tables.values():
+        if t.name == table_name:
+            return t.ref  # เช่น "A15:I19"
+    return None
+
+def parse_table_ref(ref: str):
+    """แปลง ref เช่น A15:I19 → (min_row, max_row, min_col, max_col)"""
+    from openpyxl.utils import column_index_from_string
+    import re
+    m = re.match(r"([A-Z]+)(\d+):([A-Z]+)(\d+)", ref)
+    if not m:
+        return None
+    return (int(m.group(2)), int(m.group(4)),
+            column_index_from_string(m.group(1)),
+            column_index_from_string(m.group(3)))
+
+def find_row_by_keyword(ws, keyword: str, col: int = 1, search_from: int = 1, search_to: int = 200) -> int:
+    """หา row ที่มี keyword ใน column ที่กำหนด"""
+    for r in range(search_from, search_to):
+        v = ws.cell(r, col).value
+        if v and keyword.lower() in str(v).lower():
+            return r
+    return -1
+
 def parse_excel(content_b64: str, filename: str) -> dict:
     content = base64.b64decode(content_b64)
     wb = load_workbook(io.BytesIO(content), data_only=True)
@@ -182,70 +208,98 @@ def parse_excel(content_b64: str, filename: str) -> dict:
             return v.strftime("%d/%m/%Y")
         return str(v).strip()
 
+    # ─── Header fields (rows 1-13 ไม่เคยเลื่อน) ─────────────────
     project_name     = cell(7, 3)
     report_date      = cell(8, 3)
     week_no          = cell(8, 6)
-    report_no        = cell(8, 8)   # H8
+    report_no        = cell(8, 8)
     site_manager     = cell(9, 3)
     contract_no      = cell(9, 6)
     work_hours       = cell(10, 3)
     weather_am       = cell(10, 7)
     weather_pm       = cell(10, 9)
     workforce        = cell(13, 8)
-    accident         = cell(39, 2)
-    near_miss        = cell(39, 3)
-    first_aid        = cell(39, 4)
-    safety_talk      = cell(39, 5)  # E39
-    safety_status    = cell(39, 8)  # H39
-    incident_desc    = cell(44, 1)  # A44
     imported_at      = datetime.now().strftime("%d/%m/%Y %H:%M")
 
+    # ─── หา Safety row โดยค้นหา keyword ──────────────────────────
+    # Safety section อยู่หลัง Material table — ค้นหาจาก row 30 ลงไป
+    safety_row = find_row_by_keyword(ws, "อุบัติเหตุ", col=2, search_from=30, search_to=100)
+    if safety_row == -1:
+        safety_row = find_row_by_keyword(ws, "Accidents", col=2, search_from=30, search_to=100)
+    
+    if safety_row > 0:
+        # ข้อมูล safety อยู่แถวถัดไป (header row + 1)
+        s_data_row = safety_row + 1
+        accident      = cell(s_data_row, 2)
+        near_miss     = cell(s_data_row, 3)
+        first_aid     = cell(s_data_row, 4)
+        safety_talk   = cell(s_data_row, 5)
+        safety_status = cell(s_data_row, 8)
+    else:
+        accident = near_miss = first_aid = safety_talk = safety_status = ""
+
+    # ─── หา Incident/Remarks row ──────────────────────────────────
+    incident_row = find_row_by_keyword(ws, "หมายเหตุ", col=1, search_from=safety_row if safety_row > 0 else 30, search_to=120)
+    if incident_row == -1:
+        incident_row = find_row_by_keyword(ws, "Remarks", col=1, search_from=30, search_to=120)
+    incident_desc = cell(incident_row + 1, 1) if incident_row > 0 else ""
+
+    # ─── อ่าน Activity table จาก tbl_Activity ─────────────────────
     activities = []
-    r = 16
-    ACTIVITY_TABLE_END = 19  # tbl_Activity สิ้นสุดที่ row 19 (header row 15 + 4 data rows)
-    while r <= ACTIVITY_TABLE_END:
-        act_code = cell(r, 1)
-        act_desc = cell(r, 3)
-        plan_pct = cell(r, 6)
-        actual_pct = cell(r, 7)
-        remark   = cell(r, 8)
+    if "tbl_Activity" in ws.tables:
+        tbl = ws.tables["tbl_Activity"]
+        # data rows = header_row + 1 ถึง max_row ของ table
+        import re
+        match = re.match(r"[A-Z]+(\d+):[A-Z]+(\d+)", tbl.ref)
+        if match:
+            start_row = int(match.group(1)) + 1  # +1 ข้าม header
+            end_row   = int(match.group(2))
+            for r in range(start_row, end_row + 1):
+                act_code   = cell(r, 1)
+                act_desc   = cell(r, 3)
+                plan_pct   = cell(r, 6)
+                actual_pct = cell(r, 7)
+                remark     = cell(r, 8)
+                if not act_code and not act_desc:
+                    continue
+                try:
+                    variance = str(round(float(actual_pct) - float(plan_pct), 2)) if plan_pct and actual_pct else ""
+                    status   = "Delayed" if plan_pct and actual_pct and float(actual_pct) < float(plan_pct) else "On Track"
+                except ValueError:
+                    variance = ""
+                    status   = ""
+                activities.append({
+                    "วันที่": report_date, "ชื่อโครงการ": project_name, "Report No.": report_no,
+                    "ActivityCode": act_code, "Description": act_desc,
+                    "PlanPct": plan_pct, "ActualPct": actual_pct,
+                    "Variance": variance, "Status": status, "Remark": remark,
+                    "นำเข้าเมื่อ": imported_at,
+                })
 
-        if not act_code and not act_desc:
-            r += 1
-            continue
-
-        activities.append({
-            "วันที่": report_date, "ชื่อโครงการ": project_name, "Report No.": report_no,
-            "ActivityCode": act_code, "Description": act_desc,
-            "PlanPct": plan_pct, "ActualPct": actual_pct,
-            "Variance": str(round(float(actual_pct) - float(plan_pct), 2)) if plan_pct and actual_pct else "",
-            "Status": "Delayed" if plan_pct and actual_pct and float(actual_pct) < float(plan_pct) else "On Track",
-            "Remark": remark, "นำเข้าเมื่อ": imported_at,
-        })
-        r += 1
-
+    # ─── อ่าน Material table จาก tbl_Material ─────────────────────
     materials = []
-    r = 22
-    MATERIAL_TABLE_END = 29  # tbl_Material สิ้นสุดที่ row 29 (header row 21 + 8 data rows)
-    while r <= MATERIAL_TABLE_END:
-        mat_code = cell(r, 2)
-        mat_desc = cell(r, 3)
-        mat_unit = cell(r, 5)
-        mat_qty  = cell(r, 6)
-        mat_inout = cell(r, 7)
-        mat_supplier = cell(r, 8)
-
-        if not mat_desc and not mat_qty:
-            r += 1
-            continue
-
-        materials.append({
-            "วันที่": report_date, "ชื่อโครงการ": project_name, "Report No.": report_no,
-            "MatCode": mat_code, "Description": mat_desc, "Unit": mat_unit,
-            "Qty": mat_qty, "InOut": mat_inout, "Supplier": mat_supplier,
-            "นำเข้าเมื่อ": imported_at,
-        })
-        r += 1
+    if "tbl_Material" in ws.tables:
+        tbl = ws.tables["tbl_Material"]
+        import re
+        match = re.match(r"[A-Z]+(\d+):[A-Z]+(\d+)", tbl.ref)
+        if match:
+            start_row = int(match.group(1)) + 1
+            end_row   = int(match.group(2))
+            for r in range(start_row, end_row + 1):
+                mat_code     = cell(r, 2)
+                mat_desc     = cell(r, 3)
+                mat_unit     = cell(r, 5)
+                mat_qty      = cell(r, 6)
+                mat_inout    = cell(r, 7)
+                mat_supplier = cell(r, 8)
+                if not mat_desc and not mat_qty:
+                    continue
+                materials.append({
+                    "วันที่": report_date, "ชื่อโครงการ": project_name, "Report No.": report_no,
+                    "MatCode": mat_code, "Description": mat_desc, "Unit": mat_unit,
+                    "Qty": mat_qty, "InOut": mat_inout, "Supplier": mat_supplier,
+                    "นำเข้าเมื่อ": imported_at,
+                })
 
     daily_log = {
         "วันที่": report_date, "ชื่อโครงการ": project_name, "Report No.": report_no,
@@ -254,9 +308,8 @@ def parse_excel(content_b64: str, filename: str) -> dict:
         "คนงานรวม": workforce, "อุบัติเหตุ": accident, "Near Miss": near_miss,
         "First Aid": first_aid, "Safety Talk": safety_talk, "Safety Status": safety_status,
         "Incident Description": incident_desc,
-        "นำเข้าเมื่อ": imported_at, "ไฟล์ต้นฉบับ": "",  # จะอัปเดตหลัง upload Drive
+        "นำเข้าเมื่อ": imported_at, "ไฟล์ต้นฉบับ": "",
     }
-
     log.info(f"📊 อ่านข้อมูล: {len(activities)} กิจกรรม, {len(materials)} รายการวัสดุ")
     return {
         "project_name": project_name, "report_date": report_date,
